@@ -1,0 +1,41 @@
+name: RM Announce Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run monitor
+        id: monitor
+        env:
+          FEISHU_WEBHOOKS: ${{ secrets.FEISHU_WEBHOOKS }}
+          LAST_ID_INIT: ${{ vars.LAST_ID_INIT }}
+          MONITORED_PAGES: ${{ vars.MONITORED_PAGES }}
+        run: python rm_announce_actions.py
+
+      - name: Commit state
+        if: steps.monitor.outputs.state_changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git commit -m "chore: update state [skip ci]"
+          git push
