@@ -1,0 +1,39 @@
+name: RM Forum Monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run forum monitor
+        id: monitor
+        env:
+          FORUM_FEISHU_WEBHOOKS: ${{ secrets.FORUM_FEISHU_WEBHOOKS }}
+        run: python rm_forum_actions.py
+
+      - name: Commit state
+        if: steps.monitor.outputs.state_changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add forum_state.json
+          git commit -m "chore: update forum state [skip ci]"
+          git push
