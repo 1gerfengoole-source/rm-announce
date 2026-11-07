@@ -39,5 +39,9 @@
     1972729,
     1972997,
     1977124
-  ]
+  ],
+  "pending": {},
+  "initialized": true,
+  "backfilled_ids": [],
+  "schema_version": 3
 }
