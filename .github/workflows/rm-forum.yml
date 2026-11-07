@@ -2,18 +2,35 @@ name: RM Forum Monitor
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '7-57/10 * * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only (no messages or state changes)"
+        type: boolean
+        default: true
+      backfill_confirmed:
+        description: "Replay the 16 articles confirmed skipped on 2026-11-04"
+        type: boolean
+        default: false
+
+concurrency:
+  group: rm-monitor-state
+  cancel-in-progress: false
 
 jobs:
   check-and-notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -21,19 +38,32 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests beautifulsoup4
+
+      - name: Test forum monitor
+        run: python -m unittest -v test_rm_forum
 
       - name: Run forum monitor
         id: monitor
         env:
           FORUM_FEISHU_WEBHOOKS: ${{ secrets.FORUM_FEISHU_WEBHOOKS }}
-        run: python rm_forum_actions.py
+          DRY_RUN: ${{ inputs.dry_run }}
+          BACKFILL: ${{ inputs.backfill_confirmed }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$BACKFILL" = "true" ]; then args+=(--backfill-confirmed); fi
+          python rm_forum_actions.py "${args[@]}"
 
       - name: Commit state
-        if: steps.monitor.outputs.state_changed == 'true'
+        if: always() && steps.monitor.outputs.state_changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add forum_state.json
           git commit -m "chore: update forum state [skip ci]"
-          git push
+          for attempt in 1 2 3; do
+            git pull --rebase origin main
+            if git push origin HEAD:main; then exit 0; fi
+          done
+          exit 1
