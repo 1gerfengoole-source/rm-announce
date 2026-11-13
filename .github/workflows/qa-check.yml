@@ -1,17 +1,29 @@
-name: QA Connection Check
+name: RM QA Monitor
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '3-53/10 * * * *'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: rm-monitor-state
+  cancel-in-progress: false
 
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -22,59 +34,175 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test Qingflow connection
+      - name: Monitor QA and notify Feishu
+        id: monitor
+        env:
+          QA_FEISHU_WEBHOOK: ${{ secrets.QA_FEISHU_WEBHOOK }}
         shell: python
         run: |
-          from urllib.parse import urlsplit
+          import copy
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit, urlunsplit
           from playwright.sync_api import sync_playwright
 
           URL = (
               "https://qingflow.com/appView/g79clgn1kk02/"
               "shareView/g79clh9dkk02"
           )
-          API_PATH = "/api/view/g79clh9dkk02/apply/filter"
-          results = []
+          API = "https://qingflow.com/api/view/g79clh9dkk02/apply/filter"
+          STATE = Path("qa_state.json")
+          WEBHOOK = os.environ.get("QA_FEISHU_WEBHOOK", "").strip()
 
-          def capture(response):
-              if urlsplit(response.url).path != API_PATH:
-                  return
+          FIELDS = {
+              "number": "0",
+              "school": "479990947",
+              "team": "479990948",
+              "competition": "479990952",
+              "source": "479990953",
+              "question": "479990955",
+              "question_files": "479990956",
+              "answer": "479990959",
+              "answer_files": "479990960"
+          }
 
-              print(f"答疑接口 HTTP 状态：{response.status}")
+          if not WEBHOOK:
+              raise SystemExit("缺少 QA_FEISHU_WEBHOOK")
 
+          def normalize(item):
+              answers = {
+                  str(a["queId"]): a
+                  for a in item.get("answers", [])
+              }
+              required = {"0", "479990955", "479990959"}
+              if not required <= set(answers):
+                  raise RuntimeError("答疑字段不完整，停止更新记录")
+
+              record = {}
+              for name, qid in FIELDS.items():
+                  values = answers.get(qid, {}).get("values", [])
+                  if name.endswith("_files"):
+                      files = []
+                      for value in values:
+                          raw = str(value.get("value") or "")
+                          parsed = urlsplit(raw)
+                          stable_url = urlunsplit((
+                              parsed.scheme,
+                              parsed.netloc,
+                              parsed.path,
+                              "",
+                              ""
+                          ))
+                          files.append({
+                              "name": str(
+                                  value.get("dataValue")
+                                  or value.get("otherInfo")
+                                  or ""
+                              ),
+                              "path": stable_url
+                          })
+                      record[name] = sorted(
+                          files,
+                          key=lambda x: (x["path"], x["name"])
+                      )
+                  else:
+                      record[name] = "\n".join(
+                          str(v.get("value") or "")
+                          for v in values
+                      ).strip()
+
+              if item.get("applyId") is None:
+                  raise RuntimeError("答疑缺少唯一 ID")
+              return str(item["applyId"]), record
+
+          def fingerprint(record):
+              raw = json.dumps(
+                  record,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":")
+              )
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def send(text):
+              payload = {
+                  "msg_type": "text",
+                  "content": {"text": text}
+              }
               try:
-                  result = response.json()
+                  request = urllib.request.Request(
+                      WEBHOOK,
+                      data=json.dumps(payload).encode("utf-8"),
+                      headers={"Content-Type": "application/json"},
+                      method="POST"
+                  )
+                  with urllib.request.urlopen(
+                      request, timeout=30
+                  ) as response:
+                      result = json.load(response)
+                  return (
+                      isinstance(result, dict)
+                      and result.get(
+                          "code", result.get("StatusCode")
+                      ) == 0
+                  )
               except Exception:
-                  print("答疑接口没有返回可解析的 JSON")
-                  return
+                  return False
 
-              if not isinstance(result, dict):
-                  print("答疑接口返回格式异常")
-                  return
+          def message(kind, record):
+              def shortened(value, limit):
+                  if len(value) <= limit:
+                      return value
+                  return value[:limit] + "\n……完整内容请查看原页面"
 
-              data = result.get("data")
-              if not isinstance(data, dict):
-                  print(f"接口业务码：{result.get('code')}")
-                  return
-
-              rows = data.get("list")
-              count = len(rows) if isinstance(rows, list) else 0
-
-              print(
-                  f"接口业务码：{result.get('code')}，"
-                  f"总数：{data.get('total')}，本页：{count}"
+              attachments = (
+                  len(record["question_files"])
+                  + len(record["answer_files"])
+              )
+              return (
+                  f"RoboMaster 规则答疑｜{kind}\n"
+                  f"编号：{record['number']}\n"
+                  f"赛事：{record['competition']}\n"
+                  f"学校／战队：{record['school']} / {record['team']}\n"
+                  f"来源：{record['source']}\n\n"
+                  f"【问题】\n{shortened(record['question'], 1800)}\n\n"
+                  f"【官方答复】\n"
+                  f"{shortened(record['answer'], 2500) or '暂无答复'}\n\n"
+                  f"附件：{attachments} 个，请在原页面查看\n"
+                  f"{URL}"
               )
 
-              if result.get("code") == 0 and count:
-                  results.append(data)
+          captured = []
+
+          def capture(response):
+              if response.url.split("?")[0] != API:
+                  return
+              try:
+                  result = response.json()
+                  data = result.get("data")
+                  if (
+                      result.get("code") == 0
+                      and isinstance(data, dict)
+                      and data.get("list")
+                  ):
+                      captured.append({
+                          "data": data,
+                          "body": response.request.post_data_json,
+                          "headers": response.request.all_headers()
+                      })
+              except Exception:
+                  pass
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-
               try:
                   context = browser.new_context(locale="zh-CN")
                   page = context.new_page()
                   page.on("response", capture)
-
                   page.goto(
                       URL,
                       wait_until="domcontentloaded",
@@ -83,97 +211,172 @@ jobs:
 
                   for attempt in range(3):
                       for _ in range(20):
-                          if results:
+                          if captured:
                               break
                           page.wait_for_timeout(1000)
-
-                      if results:
+                      if captured:
                           break
-
                       if attempt < 2:
-                          print("尚未取得数据，保留会话刷新页面")
+                          print("保留会话，刷新分享页面")
                           page.reload(
                               wait_until="domcontentloaded",
                               timeout=60000
                           )
 
-                  if not results:
-                      raise RuntimeError(
-                          "浏览器加载后仍未取得答疑数据，"
-                          "请查看上方接口状态日志"
-                      )
+                  if not captured:
+                      raise RuntimeError("未取得答疑数据，保留原有记录")
 
-                  data = results[-1]
-                  first = data["list"][0]
+                  sample = captured[-1]
+                  expected = sample["data"].get("total")
+                  if not isinstance(expected, int) or expected <= 0:
+                      raise RuntimeError("答疑总数异常")
 
-                  fields = {
-                      str(answer["queId"])
-                      for answer in first.get("answers", [])
+                  # 使用网页实际成功请求的参数和当前浏览器会话。
+                  headers = {
+                      k: v for k, v in sample["headers"].items()
+                      if not k.startswith(":")
+                      and k.lower() not in {
+                          "host", "content-length", "cookie",
+                          "accept-encoding", "connection"
+                      }
                   }
 
-                  required = {"0", "479990955", "479990959"}
-                  if not required <= fields:
-                      raise RuntimeError("返回数据缺少必要答疑字段")
+                  records = {}
+                  page_num = 1
+                  while True:
+                      if page_num > 200:
+                          raise RuntimeError("分页超出限制，停止运行")
 
-                  print("连接成功，问题和答复字段完整")
-                  print(f"答疑总数：{data['total']}")
-                  print(f"本页条数：{len(data['list'])}")
-                  print(f"首条编号：{first.get('applyNum')}")
+                      body = copy.deepcopy(sample["body"])
+                      body["filter"]["pageNum"] = page_num
+                      body["filter"]["pageSize"] = 50
 
+                      response = context.request.post(
+                          API,
+                          data=json.dumps(body),
+                          headers=headers,
+                          timeout=60000
+                      )
+                      if not response.ok:
+                          raise RuntimeError(
+                              f"第 {page_num} 页 HTTP 错误"
+                          )
+
+                      result = response.json()
+                      data = result.get("data")
+                      if (
+                          result.get("code") != 0
+                          or not isinstance(data, dict)
+                          or data.get("total") != expected
+                      ):
+                          raise RuntimeError(
+                              "分页期间数据总数变化或接口异常，下次重试"
+                          )
+
+                      rows = data.get("list")
+                      if not isinstance(rows, list) or not rows:
+                          raise RuntimeError("分页返回空列表")
+
+                      for item in rows:
+                          aid, record = normalize(item)
+                          if aid in records:
+                              raise RuntimeError(
+                                  "分页出现重复记录，下次重新抓取"
+                              )
+                          records[aid] = record
+
+                      print(f"已读取第 {page_num} 页：{len(rows)} 条")
+
+                      if len(records) == expected:
+                          break
+                      if len(records) > expected:
+                          raise RuntimeError("读取数量超过总数")
+                      page_num += 1
+
+                  print(f"全部分页读取完成：{len(records)} 条")
               finally:
                   browser.close()
 
-      - name: Test Feishu robot
-        env:
-          QA_FEISHU_WEBHOOK: ${{ secrets.QA_FEISHU_WEBHOOK }}
-        shell: python
-        run: |
-          import json
-          import os
-          import urllib.request
+          if STATE.exists():
+              state = json.loads(STATE.read_text(encoding="utf-8"))
+              if state.get("schema_version") != 1:
+                  raise RuntimeError("状态文件版本异常")
+              if not isinstance(state.get("records"), dict):
+                  raise RuntimeError("状态文件结构异常")
+          else:
+              state = {"schema_version": 1, "records": {}}
 
-          webhook = os.environ.get("QA_FEISHU_WEBHOOK", "").strip()
+          old_text = STATE.read_text(encoding="utf-8") if STATE.exists() else ""
+          failures = 0
 
-          if not webhook:
-              raise SystemExit(
-                  "未找到 QA_FEISHU_WEBHOOK，请检查仓库 Secret"
-              )
-
-          message = {
-              "msg_type": "text",
-              "content": {
-                  "text": (
-                      "RoboMaster 答疑汇总机器人：连接测试消息。\n"
-                      "答疑页面读取测试已通过。\n"
-                      "当前仅测试推送，自动监测尚未启用。"
-                  )
+          if not STATE.exists():
+              # 首次仅建立基线，不推送历史答疑。
+              state["records"] = {
+                  aid: fingerprint(record)
+                  for aid, record in records.items()
               }
-          }
+              print(
+                  f"首次初始化完成：记录 {len(records)} 条历史答疑，"
+                  "没有发送历史消息"
+              )
+          else:
+              sent = 0
+              unchanged = 0
+              for aid, record in sorted(
+                  records.items(),
+                  key=lambda pair: int(pair[0])
+              ):
+                  new_hash = fingerprint(record)
+                  previous = state["records"].get(aid)
 
-          try:
-              request = urllib.request.Request(
-                  webhook,
-                  data=json.dumps(message).encode("utf-8"),
-                  headers={"Content-Type": "application/json"},
-                  method="POST"
+                  if previous == new_hash:
+                      unchanged += 1
+                      continue
+
+                  kind = "新增答疑" if previous is None else "答疑更新"
+
+                  if send(message(kind, record)):
+                      # 只有飞书确认成功，才记录此版本。
+                      state["records"][aid] = new_hash
+                      sent += 1
+                      print(f"已发送：{kind} #{record['number']}")
+                  else:
+                      failures += 1
+                      print(f"发送失败，保留待重试：#{record['number']}")
+
+                  time.sleep(1)
+
+              print(
+                  f"本次发送 {sent} 条，未变化 {unchanged} 条，"
+                  f"失败 {failures} 条"
               )
 
-              with urllib.request.urlopen(
-                  request, timeout=30
-              ) as response:
-                  result = json.load(response)
+          new_text = json.dumps(
+              state, ensure_ascii=False, indent=2, sort_keys=True
+          ) + "\n"
 
-          except Exception:
-              raise SystemExit(
-                  "飞书请求失败，请检查 Webhook 和网络"
-              ) from None
+          if new_text != old_text:
+              STATE.write_text(new_text, encoding="utf-8")
+              with open(
+                  os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8"
+              ) as output:
+                  output.write("state_changed=true\n")
 
-          if not isinstance(result, dict):
-              raise SystemExit("飞书响应格式异常")
+          if failures:
+              raise SystemExit("存在发送失败，下次运行继续尝试")
 
-          code = result.get("code", result.get("StatusCode"))
-
-          if code != 0:
-              raise SystemExit(f"飞书拒绝消息，错误码：{code}")
-
-          print("飞书已确认接收测试消息")
+      - name: Save monitoring state
+        if: always() && steps.monitor.outputs.state_changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add qa_state.json
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update QA monitoring state [skip ci]"
+          for attempt in 1 2 3; do
+            git pull --rebase origin main || exit 1
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+          done
+          exit 1
