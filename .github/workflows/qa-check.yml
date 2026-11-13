@@ -50,7 +50,8 @@ jobs:
                   "User-Agent": "Mozilla/5.0",
                   "Referer": "https://qingflow.com/",
                   "Token": os.environ["QA_QINGFLOW_TOKEN"].strip(),
-                  "Wsid": "57467"
+                  "Wsid": "57467",
+                  "Cookie": "prodWsId=57467"
               },
               method="POST"
           )
