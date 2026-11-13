@@ -10,8 +10,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
@@ -36,11 +38,17 @@ jobs:
           def capture(response):
               if urlsplit(response.url).path != API_PATH:
                   return
+
               print(f"答疑接口 HTTP 状态：{response.status}")
+
               try:
                   result = response.json()
               except Exception:
                   print("答疑接口没有返回可解析的 JSON")
+                  return
+
+              if not isinstance(result, dict):
+                  print("答疑接口返回格式异常")
                   return
 
               data = result.get("data")
@@ -50,58 +58,122 @@ jobs:
 
               rows = data.get("list")
               count = len(rows) if isinstance(rows, list) else 0
+
               print(
                   f"接口业务码：{result.get('code')}，"
                   f"总数：{data.get('total')}，本页：{count}"
               )
+
               if result.get("code") == 0 and count:
                   results.append(data)
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              context = browser.new_context(locale="zh-CN")
-              page = context.new_page()
-              page.on("response", capture)
-              page.goto(
-                  URL,
-                  wait_until="domcontentloaded",
-                  timeout=60000
-              )
 
-              for attempt in range(3):
-                  for _ in range(20):
-                      if results:
-                          break
-                      page.wait_for_timeout(1000)
-                  if results:
-                      break
-                  if attempt < 2:
-                      print("尚未取得数据，保留会话刷新页面")
-                      page.reload(
-                          wait_until="domcontentloaded",
-                          timeout=60000
-                      )
+              try:
+                  context = browser.new_context(locale="zh-CN")
+                  page = context.new_page()
+                  page.on("response", capture)
 
-              if not results:
-                  browser.close()
-                  raise RuntimeError(
-                      "浏览器加载后仍未取得答疑数据，"
-                      "请查看上方接口状态日志"
+                  page.goto(
+                      URL,
+                      wait_until="domcontentloaded",
+                      timeout=60000
                   )
 
-              data = results[-1]
-              first = data["list"][0]
-              fields = {
-                  str(a["queId"])
-                  for a in first.get("answers", [])
-              }
-              required = {"0", "479990955", "479990959"}
-              if not required <= fields:
-                  browser.close()
-                  raise RuntimeError("返回数据缺少必要答疑字段")
+                  for attempt in range(3):
+                      for _ in range(20):
+                          if results:
+                              break
+                          page.wait_for_timeout(1000)
 
-              print("连接成功，问题和答复字段完整")
-              print(f"答疑总数：{data['total']}")
-              print(f"本页条数：{len(data['list'])}")
-              print(f"首条编号：{first.get('applyNum')}")
-              browser.close()
+                      if results:
+                          break
+
+                      if attempt < 2:
+                          print("尚未取得数据，保留会话刷新页面")
+                          page.reload(
+                              wait_until="domcontentloaded",
+                              timeout=60000
+                          )
+
+                  if not results:
+                      raise RuntimeError(
+                          "浏览器加载后仍未取得答疑数据，"
+                          "请查看上方接口状态日志"
+                      )
+
+                  data = results[-1]
+                  first = data["list"][0]
+
+                  fields = {
+                      str(answer["queId"])
+                      for answer in first.get("answers", [])
+                  }
+
+                  required = {"0", "479990955", "479990959"}
+                  if not required <= fields:
+                      raise RuntimeError("返回数据缺少必要答疑字段")
+
+                  print("连接成功，问题和答复字段完整")
+                  print(f"答疑总数：{data['total']}")
+                  print(f"本页条数：{len(data['list'])}")
+                  print(f"首条编号：{first.get('applyNum')}")
+
+              finally:
+                  browser.close()
+
+      - name: Test Feishu robot
+        env:
+          QA_FEISHU_WEBHOOK: ${{ secrets.QA_FEISHU_WEBHOOK }}
+        shell: python
+        run: |
+          import json
+          import os
+          import urllib.request
+
+          webhook = os.environ.get("QA_FEISHU_WEBHOOK", "").strip()
+
+          if not webhook:
+              raise SystemExit(
+                  "未找到 QA_FEISHU_WEBHOOK，请检查仓库 Secret"
+              )
+
+          message = {
+              "msg_type": "text",
+              "content": {
+                  "text": (
+                      "RoboMaster 答疑汇总机器人：连接测试消息。\n"
+                      "答疑页面读取测试已通过。\n"
+                      "当前仅测试推送，自动监测尚未启用。"
+                  )
+              }
+          }
+
+          try:
+              request = urllib.request.Request(
+                  webhook,
+                  data=json.dumps(message).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(
+                  request, timeout=30
+              ) as response:
+                  result = json.load(response)
+
+          except Exception:
+              raise SystemExit(
+                  "飞书请求失败，请检查 Webhook 和网络"
+              ) from None
+
+          if not isinstance(result, dict):
+              raise SystemExit("飞书响应格式异常")
+
+          code = result.get("code", result.get("StatusCode"))
+
+          if code != 0:
+              raise SystemExit(f"飞书拒绝消息，错误码：{code}")
+
+          print("飞书已确认接收测试消息")
