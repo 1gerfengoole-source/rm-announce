@@ -1,0 +1,75 @@
+name: QA Connection Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test Qingflow connection
+        shell: python
+        run: |
+          import json
+          import urllib.request
+
+          url = "https://qingflow.com/api/view/g79clh9dkk02/apply/filter"
+          payload = {
+              "filter": {
+                  "pageSize": 50,
+                  "pageNum": 1,
+                  "type": 8,
+                  "sorts": [{
+                      "queId": 0,
+                      "isAscend": False,
+                      "queType": 8,
+                      "sortType": "customFieldSort"
+                  }],
+                  "queries": [],
+                  "queryKey": None
+              }
+          }
+
+          request = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Content-Type": "application/json",
+                  "User-Agent": "Mozilla/5.0",
+                  "Referer": "https://qingflow.com/appView/g79clgn1kk02/shareView/g79clh9dkk02"
+              },
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.load(response)
+
+          if result.get("code") != 0:
+              raise RuntimeError(
+                  f"接口未成功，错误码：{result.get('code')}"
+              )
+
+          data = result["data"]
+          rows = data["list"]
+          if not rows:
+              raise RuntimeError("接口返回空列表，需要检查访问权限")
+
+          fields = {
+              str(answer["queId"])
+              for answer in rows[0]["answers"]
+          }
+          if not {"0", "479990955", "479990959"} <= fields:
+              raise RuntimeError("缺少编号、问题或答复字段")
+
+          print("连接成功，问题和答复字段完整")
+          print(f"答疑总数：{data['total']}")
+          print(f"本页条数：{len(rows)}")
+          print(f"首条编号：{rows[0]['applyNum']}")
