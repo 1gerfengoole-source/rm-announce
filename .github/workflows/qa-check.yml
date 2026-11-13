@@ -17,8 +17,11 @@ jobs:
 
       - name: Test Qingflow connection
         shell: python
+        env:
+          QA_QINGFLOW_TOKEN: ${{ secrets.QA_QINGFLOW_TOKEN }}
         run: |
           import json
+          import os
           import urllib.request
 
           url = "https://qingflow.com/api/view/g79clh9dkk02/apply/filter"
@@ -43,8 +46,11 @@ jobs:
               data=json.dumps(payload).encode("utf-8"),
               headers={
                   "Content-Type": "application/json",
+                  "Accept": "application/json, text/plain, */*",
                   "User-Agent": "Mozilla/5.0",
-                  "Referer": "https://qingflow.com/appView/g79clgn1kk02/shareView/g79clh9dkk02"
+                  "Referer": "https://qingflow.com/",
+                  "Token": os.environ["QA_QINGFLOW_TOKEN"].strip(),
+                  "Wsid": "57467"
               },
               method="POST"
           )
