@@ -9,74 +9,99 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Install browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
       - name: Test Qingflow connection
         shell: python
-        env:
-          QA_QINGFLOW_TOKEN: ${{ secrets.QA_QINGFLOW_TOKEN }}
         run: |
-          import json
-          import os
-          import urllib.request
+          from urllib.parse import urlsplit
+          from playwright.sync_api import sync_playwright
 
-          url = "https://qingflow.com/api/view/g79clh9dkk02/apply/filter"
-          payload = {
-              "filter": {
-                  "pageSize": 50,
-                  "pageNum": 1,
-                  "type": 8,
-                  "sorts": [{
-                      "queId": 0,
-                      "isAscend": False,
-                      "queType": 8,
-                      "sortType": "customFieldSort"
-                  }],
-                  "queries": [],
-                  "queryKey": None
-              }
-          }
-
-          request = urllib.request.Request(
-              url,
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Content-Type": "application/json",
-                  "Accept": "application/json, text/plain, */*",
-                  "User-Agent": "Mozilla/5.0",
-                  "Referer": "https://qingflow.com/",
-                  "Token": os.environ["QA_QINGFLOW_TOKEN"].strip(),
-                  "Wsid": "57467",
-                  "Cookie": "prodWsId=57467"
-              },
-              method="POST"
+          URL = (
+              "https://qingflow.com/appView/g79clgn1kk02/"
+              "shareView/g79clh9dkk02"
           )
+          API_PATH = "/api/view/g79clh9dkk02/apply/filter"
+          results = []
 
-          with urllib.request.urlopen(request, timeout=30) as response:
-              result = json.load(response)
+          def capture(response):
+              if urlsplit(response.url).path != API_PATH:
+                  return
+              print(f"答疑接口 HTTP 状态：{response.status}")
+              try:
+                  result = response.json()
+              except Exception:
+                  print("答疑接口没有返回可解析的 JSON")
+                  return
 
-          if result.get("code") != 0:
-              raise RuntimeError(
-                  f"接口未成功，错误码：{result.get('code')}"
+              data = result.get("data")
+              if not isinstance(data, dict):
+                  print(f"接口业务码：{result.get('code')}")
+                  return
+
+              rows = data.get("list")
+              count = len(rows) if isinstance(rows, list) else 0
+              print(
+                  f"接口业务码：{result.get('code')}，"
+                  f"总数：{data.get('total')}，本页：{count}"
+              )
+              if result.get("code") == 0 and count:
+                  results.append(data)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(locale="zh-CN")
+              page = context.new_page()
+              page.on("response", capture)
+              page.goto(
+                  URL,
+                  wait_until="domcontentloaded",
+                  timeout=60000
               )
 
-          data = result["data"]
-          rows = data["list"]
-          if not rows:
-              raise RuntimeError("接口返回空列表，需要检查访问权限")
+              for attempt in range(3):
+                  for _ in range(20):
+                      if results:
+                          break
+                      page.wait_for_timeout(1000)
+                  if results:
+                      break
+                  if attempt < 2:
+                      print("尚未取得数据，保留会话刷新页面")
+                      page.reload(
+                          wait_until="domcontentloaded",
+                          timeout=60000
+                      )
 
-          fields = {
-              str(answer["queId"])
-              for answer in rows[0]["answers"]
-          }
-          if not {"0", "479990955", "479990959"} <= fields:
-              raise RuntimeError("缺少编号、问题或答复字段")
+              if not results:
+                  browser.close()
+                  raise RuntimeError(
+                      "浏览器加载后仍未取得答疑数据，"
+                      "请查看上方接口状态日志"
+                  )
 
-          print("连接成功，问题和答复字段完整")
-          print(f"答疑总数：{data['total']}")
-          print(f"本页条数：{len(rows)}")
-          print(f"首条编号：{rows[0]['applyNum']}")
+              data = results[-1]
+              first = data["list"][0]
+              fields = {
+                  str(a["queId"])
+                  for a in first.get("answers", [])
+              }
+              required = {"0", "479990955", "479990959"}
+              if not required <= fields:
+                  browser.close()
+                  raise RuntimeError("返回数据缺少必要答疑字段")
+
+              print("连接成功，问题和答复字段完整")
+              print(f"答疑总数：{data['total']}")
+              print(f"本页条数：{len(data['list'])}")
+              print(f"首条编号：{first.get('applyNum')}")
+              browser.close()
